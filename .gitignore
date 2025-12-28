@@ -1,24 +1,11 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
+# Ignore everything by default
+*
 
-# Virtualenvs
-.venv/
-venv/
+# Keep directories (so negation rules can match files inside)
+!*/
 
-# Editors
-.vscode/
-.idea/
+# Keep Python sources
+!*.py
 
-# Nuitka build/output (common patterns)
-*.build/
-*.dist/
-*.onefile-build/
-*.bin
-*.app
-dist/
-build/
-
-# Misc
-.DS_Store
+# Keep .gitignore itself
+!.gitignore
