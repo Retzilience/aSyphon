@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtualenvs
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Nuitka build/output (common patterns)
+*.build/
+*.dist/
+*.onefile-build/
+*.bin
+*.app
+dist/
+build/
+
+# Misc
+.DS_Store

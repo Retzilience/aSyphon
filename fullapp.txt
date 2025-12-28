@@ -1,0 +1,1885 @@
+# backend.py
+from __future__ import annotations
+
+import json
+import subprocess
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import pulsectl
+
+from models import AudioNode
+
+
+@dataclass(frozen=True)
+class PwPort:
+    id: int
+    node_id: int
+    node_name: str
+    port_name: str
+    direction: str  # "in" | "out"
+    channel: str    # "FL","FR","FC","LFE","RL","RR","SL","SR","MONO","AUX0"... or ""
+    full_name: str  # "node.name:port.name"
+
+
+@dataclass(frozen=True)
+class PwLink:
+    id: int
+    out_port_id: int
+    in_port_id: int
+
+
+@dataclass
+class PwGraph:
+    nodes: Dict[int, AudioNode]
+    ports: Dict[int, PwPort]
+    links: List[PwLink]
+
+
+def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _props(obj: Dict[str, Any]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for src in (obj.get("props") or {}, (obj.get("info") or {}).get("props") or {}):
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            try:
+                ks = str(k)
+            except Exception:
+                continue
+            try:
+                vs = "" if v is None else str(v)
+            except Exception:
+                vs = ""
+            out[ks] = vs
+    return out
+
+
+def _get_media_class(props: Dict[str, str]) -> str:
+    return props.get("media.class", "")
+
+
+def _get_node_name(props: Dict[str, str]) -> str:
+    return props.get("node.name", "")
+
+
+def _get_node_desc(props: Dict[str, str]) -> str:
+    return props.get("node.description") or props.get("node.nick") or props.get("node.name") or ""
+
+
+def _get_port_name(props: Dict[str, str]) -> str:
+    return props.get("port.name", "")
+
+
+def _get_port_direction(props: Dict[str, str], info: Dict[str, Any]) -> str:
+    d = (props.get("port.direction") or "").strip().lower()
+    if d in ("in", "out"):
+        return d
+    d2 = (info.get("direction") or "").strip().lower() if isinstance(info, dict) else ""
+    if d2 in ("in", "out"):
+        return d2
+    return ""
+
+
+def _normalize_channel(v: str) -> str:
+    s = (v or "").strip().lower()
+    if not s:
+        return ""
+
+    mapping = {
+        "fl": "FL",
+        "fr": "FR",
+        "fc": "FC",
+        "lfe": "LFE",
+        "rl": "RL",
+        "rr": "RR",
+        "sl": "SL",
+        "sr": "SR",
+        "mono": "MONO",
+        "front-left": "FL",
+        "front-right": "FR",
+        "front-center": "FC",
+        "low-frequency": "LFE",
+        "rear-left": "RL",
+        "rear-right": "RR",
+        "side-left": "SL",
+        "side-right": "SR",
+    }
+    if s in mapping:
+        return mapping[s]
+
+    if s.startswith("aux"):
+        tail = s[3:]
+        if tail.isdigit():
+            return f"AUX{int(tail)}"
+
+    return s.upper()
+
+
+def _channel_from_port(props: Dict[str, str]) -> str:
+    for k in ("audio.channel", "audio.position"):
+        if k in props and props[k]:
+            return _normalize_channel(props[k])
+
+    pn = (props.get("port.name") or "").strip()
+    if not pn:
+        return ""
+    parts = pn.split("_")
+    if len(parts) >= 2:
+        candidate = parts[-1]
+        n = _normalize_channel(candidate)
+        if n:
+            return n
+    up = pn.upper()
+    for tag in ("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR", "MONO"):
+        if up.endswith(tag):
+            return tag
+    return ""
+
+
+def _is_stream_node(node: AudioNode) -> bool:
+    mc = node.media_class
+    return mc.startswith("Stream/") and "Output" in mc and mc.endswith("/Audio")
+
+
+def _is_source_node(node: AudioNode) -> bool:
+    return node.media_class == "Audio/Source"
+
+
+def _is_sink_node(node: AudioNode) -> bool:
+    return node.media_class == "Audio/Sink"
+
+
+def _is_monitor_node(node: AudioNode) -> bool:
+    return node.name.endswith(".monitor") or node.props.get("node.name", "").endswith(".monitor")
+
+
+def _is_internal_node(node: AudioNode) -> bool:
+    app = (node.props.get("application.name") or "").strip()
+    return app in ("PipeWire", "WirePlumber", "PulseAudio")
+
+
+def _pw_dump_graph() -> PwGraph:
+    p = _run(["pw-dump"])
+    if p.returncode != 0:
+        raise RuntimeError(f"pw-dump failed: {p.stderr.strip() or p.stdout.strip()}")
+
+    try:
+        data = json.loads(p.stdout)
+    except Exception as e:
+        raise RuntimeError(f"pw-dump output is not valid JSON: {e}") from e
+
+    if not isinstance(data, list):
+        raise RuntimeError("pw-dump output JSON is not a list")
+
+    nodes: Dict[int, AudioNode] = {}
+    ports: Dict[int, PwPort] = {}
+    links: List[PwLink] = []
+
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        t = str(obj.get("type") or "")
+        if not t.endswith(":Node"):
+            continue
+        oid = int(obj.get("id"))
+        pr = _props(obj)
+        nodes[oid] = AudioNode(
+            id=oid,
+            name=_get_node_name(pr),
+            description=_get_node_desc(pr),
+            media_class=_get_media_class(pr),
+            props=pr,
+        )
+
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        t = str(obj.get("type") or "")
+        if not t.endswith(":Port"):
+            continue
+        oid = int(obj.get("id"))
+        pr = _props(obj)
+        info = obj.get("info") or {}
+
+        try:
+            node_id = int(pr.get("node.id", "0"))
+        except Exception:
+            node_id = 0
+
+        node = nodes.get(node_id)
+        node_name = node.name if node else ""
+
+        port_name = _get_port_name(pr)
+        direction = _get_port_direction(pr, info)
+        channel = _channel_from_port(pr)
+        full_name = f"{node_name}:{port_name}" if node_name and port_name else ""
+
+        ports[oid] = PwPort(
+            id=oid,
+            node_id=node_id,
+            node_name=node_name,
+            port_name=port_name,
+            direction=direction,
+            channel=channel,
+            full_name=full_name,
+        )
+
+    for obj in data:
+        if not isinstance(obj, dict):
+            continue
+        t = str(obj.get("type") or "")
+        if not t.endswith(":Link"):
+            continue
+        oid = int(obj.get("id"))
+        pr = _props(obj)
+
+        out_pid = pr.get("link.output.port") or pr.get("link.output.port.id")
+        in_pid = pr.get("link.input.port") or pr.get("link.input.port.id")
+        if not out_pid or not in_pid:
+            continue
+        try:
+            out_i = int(out_pid)
+            in_i = int(in_pid)
+        except Exception:
+            continue
+
+        links.append(PwLink(id=oid, out_port_id=out_i, in_port_id=in_i))
+
+    return PwGraph(nodes=nodes, ports=ports, links=links)
+
+
+def _pw_link_connect(out_full: str, in_full: str) -> None:
+    if not out_full or not in_full:
+        raise RuntimeError("Invalid port names for link creation.")
+    p = _run(["pw-link", out_full, in_full])
+    if p.returncode == 0:
+        return
+    msg = (p.stderr or p.stdout).strip()
+    low = msg.lower()
+    if "exist" in low or "already" in low:
+        return
+    raise RuntimeError(f"pw-link connect failed ({out_full} -> {in_full}): {msg}")
+
+
+def _pw_link_disconnect(out_full: str, in_full: str) -> None:
+    if not out_full or not in_full:
+        return
+    p = _run(["pw-link", "-d", out_full, in_full])
+    if p.returncode == 0:
+        return
+    msg = (p.stderr or p.stdout).strip().lower()
+    if "no such" in msg or "not found" in msg or "does not exist" in msg:
+        return
+    return
+
+
+def _canonical_channel_order() -> List[str]:
+    return [
+        "MONO",
+        "FL", "FR",
+        "FC", "LFE",
+        "SL", "SR",
+        "RL", "RR",
+        "AUX0", "AUX1", "AUX2", "AUX3", "AUX4", "AUX5", "AUX6", "AUX7", "AUX8", "AUX9",
+        "AUX10", "AUX11", "AUX12", "AUX13", "AUX14", "AUX15",
+    ]
+
+
+def _select_ports_by_direction(graph: PwGraph, node_id: int, direction: str) -> List[PwPort]:
+    out = [p for p in graph.ports.values() if p.node_id == node_id and p.direction == direction and p.full_name]
+
+    order = _canonical_channel_order()
+    by_chan: Dict[str, PwPort] = {}
+    for p in out:
+        if p.channel and p.channel not in by_chan:
+            by_chan[p.channel] = p
+
+    if by_chan:
+        ordered: List[PwPort] = []
+        used: set[int] = set()
+        for ch in order:
+            if ch in by_chan:
+                ordered.append(by_chan[ch])
+                used.add(by_chan[ch].id)
+        for p in sorted(out, key=lambda x: x.id):
+            if p.id not in used:
+                ordered.append(p)
+        return ordered
+
+    return sorted(out, key=lambda x: x.id)
+
+
+def _map_ports_1_to_1(src_ports: List[PwPort], dst_ports: List[PwPort]) -> List[Tuple[str, str]]:
+    if not src_ports or not dst_ports:
+        return []
+
+    src_by_ch: Dict[str, PwPort] = {p.channel: p for p in src_ports if p.channel}
+    dst_by_ch: Dict[str, PwPort] = {p.channel: p for p in dst_ports if p.channel}
+
+    pairs: List[Tuple[str, str]] = []
+
+    if src_by_ch and dst_by_ch:
+        for ch in _canonical_channel_order():
+            if ch in src_by_ch and ch in dst_by_ch:
+                pairs.append((src_by_ch[ch].full_name, dst_by_ch[ch].full_name))
+        if pairs:
+            return pairs
+
+    n = min(len(src_ports), len(dst_ports))
+    for i in range(n):
+        pairs.append((src_ports[i].full_name, dst_ports[i].full_name))
+    return pairs
+
+
+class PipeWireHubBackend:
+    HUB_SINK_NAME = "asiphon"
+    HUB_DESC = "aSyphon"
+
+    def __init__(self, pulse_client_name: str = "asiphon-gui") -> None:
+        self._pulse_client_name = pulse_client_name
+        self._pulse: Optional[pulsectl.Pulse] = None
+        self._hub_pulse_module_id: Optional[int] = None
+        self._graph: PwGraph = PwGraph(nodes={}, ports={}, links=[])
+
+        self.refresh()
+        self.ensure_hub_sink()
+
+    def refresh(self) -> None:
+        self._graph = _pw_dump_graph()
+
+    def server_label(self) -> str:
+        return "PipeWire (native graph)"
+
+    def _pulse_connect(self) -> pulsectl.Pulse:
+        if self._pulse is None:
+            self._pulse = pulsectl.Pulse(self._pulse_client_name)
+        return self._pulse
+
+    def close(self) -> None:
+        if self._pulse is not None:
+            try:
+                self._pulse.close()
+            except Exception:
+                pass
+        self._pulse = None
+
+    def _find_node_by_name(self, name: str) -> Optional[AudioNode]:
+        for n in self._graph.nodes.values():
+            if n.name == name:
+                return n
+        return None
+
+    def _node_channel_count(self, node_id: int, direction: str) -> int:
+        ports = _select_ports_by_direction(self._graph, node_id, direction)
+        chans = [p.channel for p in ports if p.channel]
+        return len(set(chans)) if chans else len(ports)
+
+    def hub_exists(self) -> bool:
+        self.refresh()
+        hub = self._find_node_by_name(self.HUB_SINK_NAME)
+        return bool(hub is not None and _is_sink_node(hub))
+
+    def hub_node_optional(self) -> Optional[AudioNode]:
+        self.refresh()
+        hub = self._find_node_by_name(self.HUB_SINK_NAME)
+        if hub is None or not _is_sink_node(hub):
+            return None
+        return hub
+
+    def ensure_hub_sink(self) -> None:
+        self.refresh()
+        hub = self._find_node_by_name(self.HUB_SINK_NAME)
+        if hub is not None and _is_sink_node(hub):
+            return
+
+        try:
+            pulse = self._pulse_connect()
+            existing = None
+            for s in pulse.sink_list():
+                if s.name == self.HUB_SINK_NAME:
+                    existing = s
+                    break
+
+            if existing is None:
+                args = " ".join(
+                    [
+                        f"sink_name={self.HUB_SINK_NAME}",
+                        f"sink_properties=device.description={self.HUB_DESC}",
+                    ]
+                )
+                mid = pulse.module_load("module-null-sink", args)
+                self._hub_pulse_module_id = int(mid)
+            else:
+                self._hub_pulse_module_id = None
+        except Exception as e:
+            raise RuntimeError(f"Failed to ensure hub sink via pipewire-pulse: {e}") from e
+
+        self.refresh()
+        hub = self._find_node_by_name(self.HUB_SINK_NAME)
+        if hub is None or not _is_sink_node(hub):
+            raise RuntimeError("Hub sink was created via Pulse, but is not visible in PipeWire graph.")
+
+    def destroy_hub_sink(self) -> None:
+        """
+        Best-effort removal of the hub sink.
+        - If we created it (stored module id), unload that module.
+        - Else, try unloading the sink's owner_module (if available).
+        """
+        try:
+            pulse = self._pulse_connect()
+        except Exception:
+            pulse = None
+
+        unloaded = False
+
+        if pulse is not None and self._hub_pulse_module_id is not None:
+            try:
+                pulse.module_unload(self._hub_pulse_module_id)
+                unloaded = True
+            except Exception:
+                pass
+            self._hub_pulse_module_id = None
+
+        if pulse is not None and not unloaded:
+            try:
+                target = None
+                for s in pulse.sink_list():
+                    if s.name == self.HUB_SINK_NAME:
+                        target = s
+                        break
+                if target is not None:
+                    owner = getattr(target, "owner_module", None)
+                    if owner is not None:
+                        pulse.module_unload(int(owner))
+            except Exception:
+                pass
+
+        self.refresh()
+
+    def destroy_hub_sink_if_owned(self) -> None:
+        if self._hub_pulse_module_id is None:
+            return
+        try:
+            pulse = self._pulse_connect()
+            pulse.module_unload(self._hub_pulse_module_id)
+        except Exception:
+            pass
+        self._hub_pulse_module_id = None
+        self.refresh()
+
+    def hub_node(self) -> AudioNode:
+        self.refresh()
+        hub = self._find_node_by_name(self.HUB_SINK_NAME)
+        if hub is None:
+            raise RuntimeError("Hub sink is missing.")
+        return hub
+
+    def hub_input_ports(self) -> List[PwPort]:
+        hub = self.hub_node()
+        return _select_ports_by_direction(self._graph, hub.id, "in")
+
+    def hub_monitor_ports(self) -> List[PwPort]:
+        hub = self.hub_node()
+        out_ports = _select_ports_by_direction(self._graph, hub.id, "out")
+        monitors = [p for p in out_ports if p.port_name.startswith("monitor_") or p.port_name.startswith("monitor.")]
+        return monitors if monitors else out_ports
+
+    def list_stream_nodes(self) -> List[AudioNode]:
+        self.refresh()
+        out: List[AudioNode] = []
+        for n in self._graph.nodes.values():
+            if not _is_stream_node(n):
+                continue
+            if _is_internal_node(n):
+                continue
+            out.append(n)
+        return out
+
+    def list_source_nodes(self) -> List[AudioNode]:
+        self.refresh()
+        out: List[AudioNode] = []
+        for n in self._graph.nodes.values():
+            if not _is_source_node(n):
+                continue
+            if _is_monitor_node(n):
+                continue
+            if n.name == f"{self.HUB_SINK_NAME}.monitor":
+                continue
+            out.append(n)
+        return out
+
+    def list_sink_nodes(self) -> List[AudioNode]:
+        self.refresh()
+        return [n for n in self._graph.nodes.values() if _is_sink_node(n)]
+
+    def stream_label(self, n: AudioNode) -> str:
+        app = n.props.get("application.name") or n.props.get("application.process.binary") or "App"
+        media = n.props.get("media.name") or n.props.get("node.nick") or n.description or n.name
+        base = f"{app} — {media}" if media and media != app else f"{app}"
+        return f"{base}  [id {n.id}]"
+
+    def node_label_with_ch(self, n: AudioNode, direction: str) -> str:
+        ch = self._node_channel_count(n.id, direction)
+        desc = n.description or n.name
+        return f"{desc}  [{n.name}]  ({ch}ch)"
+
+    def _connect_pairs(self, pairs: List[Tuple[str, str]]) -> None:
+        for out_full, in_full in pairs:
+            _pw_link_connect(out_full, in_full)
+
+    def _disconnect_pairs(self, pairs: List[Tuple[str, str]]) -> None:
+        for out_full, in_full in pairs:
+            _pw_link_disconnect(out_full, in_full)
+
+    def connect_stream_to_hub(self, stream_node_id: int) -> List[Tuple[str, str]]:
+        """
+        Non-exclusive routing (requested):
+        - Do not drop existing connections.
+        - Add links: stream outputs -> hub inputs (1:1 mapping).
+        """
+        self.ensure_hub_sink()
+        self.refresh()
+        hub = self.hub_node()
+
+        stream_out_ports = _select_ports_by_direction(self._graph, stream_node_id, "out")
+        hub_in_ports = _select_ports_by_direction(self._graph, hub.id, "in")
+        if not stream_out_ports or not hub_in_ports:
+            raise RuntimeError("Cannot link: missing stream output ports or hub input ports.")
+
+        created = _map_ports_1_to_1(stream_out_ports, hub_in_ports)
+        if not created:
+            raise RuntimeError("No compatible port pairs for stream -> hub.")
+        self._connect_pairs(created)
+        return created
+
+    def connect_source_to_hub(self, source_node_id: int) -> List[Tuple[str, str]]:
+        self.ensure_hub_sink()
+        self.refresh()
+        hub = self.hub_node()
+
+        src_out_ports = _select_ports_by_direction(self._graph, source_node_id, "out")
+        hub_in_ports = _select_ports_by_direction(self._graph, hub.id, "in")
+        if not src_out_ports or not hub_in_ports:
+            raise RuntimeError("Cannot link: missing source output ports or hub input ports.")
+
+        created = _map_ports_1_to_1(src_out_ports, hub_in_ports)
+        if not created:
+            raise RuntimeError("No compatible port pairs for source -> hub.")
+        self._connect_pairs(created)
+        return created
+
+    def _sink_monitor_output_ports(self, sink_node_id: int) -> List[PwPort]:
+        self.refresh()
+        sink = self._graph.nodes.get(sink_node_id)
+        if sink is None:
+            return []
+
+        out_ports = _select_ports_by_direction(self._graph, sink.id, "out")
+        monitors = [p for p in out_ports if p.port_name.startswith("monitor_") or p.port_name.startswith("monitor.")]
+        if monitors:
+            return monitors
+
+        mon_node = self._find_node_by_name(f"{sink.name}.monitor")
+        if mon_node is None:
+            return []
+        return _select_ports_by_direction(self._graph, mon_node.id, "out")
+
+    def connect_sink_tap_to_hub(self, sink_node_id: int) -> List[Tuple[str, str]]:
+        self.ensure_hub_sink()
+        self.refresh()
+        hub = self.hub_node()
+
+        if sink_node_id == hub.id:
+            raise RuntimeError("Cannot tap aSyphon into itself.")
+
+        tap_out_ports = self._sink_monitor_output_ports(sink_node_id)
+        hub_in_ports = _select_ports_by_direction(self._graph, hub.id, "in")
+        if not tap_out_ports or not hub_in_ports:
+            raise RuntimeError("Cannot link: missing sink monitor ports or hub input ports.")
+
+        created = _map_ports_1_to_1(tap_out_ports, hub_in_ports)
+        if not created:
+            raise RuntimeError("No compatible port pairs for sink monitor -> hub.")
+        self._connect_pairs(created)
+        return created
+
+    def connect_hub_to_sink(self, sink_node_id: int) -> List[Tuple[str, str]]:
+        self.ensure_hub_sink()
+        self.refresh()
+        hub = self.hub_node()
+
+        if sink_node_id == hub.id:
+            raise RuntimeError("Cannot output to aSyphon itself.")
+
+        hub_out_ports = self.hub_monitor_ports()
+        sink_in_ports = _select_ports_by_direction(self._graph, sink_node_id, "in")
+        if not hub_out_ports or not sink_in_ports:
+            raise RuntimeError("Cannot link: missing hub monitor ports or sink input ports.")
+
+        created = _map_ports_1_to_1(hub_out_ports, sink_in_ports)
+        if not created:
+            raise RuntimeError("No compatible port pairs for hub -> sink.")
+        self._connect_pairs(created)
+        return created
+
+    def disconnect_pairs(self, pairs: List[Tuple[str, str]]) -> None:
+        self._disconnect_pairs(pairs)
+# main.py
+from __future__ import annotations
+
+import sys
+
+from PySide6.QtWidgets import QApplication
+
+from theme import apply_dark_theme
+from main_window import MainWindow
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    apply_dark_theme(app)
+
+    w = MainWindow()
+    w.show()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# main_window.py
+from __future__ import annotations
+
+from typing import List
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QMessageBox,
+    QScrollArea,
+    QFrame,
+    QSizePolicy,
+    QCheckBox,
+)
+
+from backend import PipeWireHubBackend
+from models import InputChoice, OutputChoice
+from rows import InputRow, OutputRow
+from widgets import StatusPill
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("aSyphon")
+        self.resize(1220, 640)
+
+        self.backend = PipeWireHubBackend()
+        self._input_choices: List[InputChoice] = []
+        self._output_choices: List[OutputChoice] = []
+
+        # Hub desired presence (None = no pending change)
+        self._hub_desired_present: bool | None = None
+
+        root = QWidget()
+        outer = QVBoxLayout()
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(10)
+        root.setLayout(outer)
+        self.setCentralWidget(root)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+
+        title = QLabel("aSyphon")
+        title.setObjectName("Title")
+
+        self.server = QLabel(self.backend.server_label())
+        self.server.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        self.auto_refresh = QCheckBox("Auto refresh")
+        self.auto_refresh.setChecked(True)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_everything)
+
+        self.apply_btn = QPushButton("Apply")
+        self.apply_btn.setObjectName("Primary")
+        self.apply_btn.clicked.connect(self.apply_all)
+
+        header.addWidget(title)
+        header.addSpacing(8)
+        header.addWidget(QLabel("Backend:"))
+        header.addWidget(self.server, 2)
+        header.addStretch(1)
+        header.addWidget(self.auto_refresh)
+        header.addWidget(refresh_btn)
+        header.addWidget(self.apply_btn)
+
+        outer.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        self.inputs_panel = self._make_panel("Inputs → aSyphon", "+ Input", self.add_input_row)
+        self.inputs_list = self._make_scroll_list()
+        self.inputs_panel_layout.addWidget(self.inputs_list, 1)
+
+        self.hub_panel = self._make_hub_panel()
+
+        self.outputs_panel = self._make_panel("aSyphon → Outputs", "+ Output", self.add_output_row)
+        self.outputs_list = self._make_scroll_list()
+        self.outputs_panel_layout.addWidget(self.outputs_list, 1)
+
+        body.addWidget(self.inputs_panel, 3)
+        body.addWidget(self.hub_panel, 2)
+        body.addWidget(self.outputs_panel, 3)
+
+        outer.addLayout(body, 1)
+
+        self.add_input_row()
+        self.add_output_row()
+
+        self.refresh_everything()
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(1200)
+        self.timer.timeout.connect(self.refresh_streams_only)
+        self.timer.start()
+
+    def _make_panel(self, title: str, add_label: str, add_cb) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("Panel")
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        frame.setLayout(layout)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+
+        t = QLabel(title)
+        f = QFont()
+        f.setPointSize(12)
+        f.setWeight(QFont.DemiBold)
+        t.setFont(f)
+
+        add_btn = QPushButton(add_label)
+        add_btn.clicked.connect(add_cb)
+
+        top.addWidget(t)
+        top.addStretch(1)
+        top.addWidget(add_btn)
+
+        layout.addLayout(top)
+
+        if "Inputs" in title:
+            self.inputs_panel_layout = layout
+        else:
+            self.outputs_panel_layout = layout
+
+        return frame
+
+    def _make_scroll_list(self) -> QScrollArea:
+        container = QWidget()
+        v = QVBoxLayout()
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        container.setLayout(v)
+        v.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(container)
+        scroll._container = container  # type: ignore[attr-defined]
+        scroll._layout = v             # type: ignore[attr-defined]
+        return scroll
+
+    def _make_hub_panel(self) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("Panel")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+        frame.setLayout(layout)
+
+        h = QLabel("aSyphon (hub sink)")
+        f = QFont()
+        f.setPointSize(12)
+        f.setWeight(QFont.DemiBold)
+        h.setFont(f)
+        layout.addWidget(h)
+
+        # Hub controls
+        ctl = QHBoxLayout()
+        ctl.setSpacing(10)
+
+        self.hub_status = StatusPill()
+        self.hub_btn = QPushButton("")
+        self.hub_btn.clicked.connect(self._toggle_hub_desired)
+
+        ctl.addWidget(self.hub_status, 0, Qt.AlignVCenter)
+        ctl.addWidget(self.hub_btn, 1)
+
+        layout.addLayout(ctl)
+
+        self.hub_info = QLabel("")
+        self.hub_info.setWordWrap(True)
+        self.hub_info.setStyleSheet("color: #cfd3da;")
+        layout.addWidget(self.hub_info)
+
+        hint = QLabel(
+            "• Routing uses PipeWire links (qpwgraph-style), not Pulse loopback modules.\n"
+            "• aSyphon sink is created via pipewire-pulse for Pulse app compatibility.\n"
+            "• Per-row remove and hub create/destroy are pending until Apply."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #aeb3bc;")
+        layout.addWidget(hint)
+
+        layout.addStretch(1)
+        return frame
+
+    def _toggle_hub_desired(self) -> None:
+        actual = self.backend.hub_exists()
+
+        if self._hub_desired_present is None:
+            self._hub_desired_present = (not actual)
+        else:
+            # Second click cancels pending change.
+            self._hub_desired_present = None
+
+        self._update_hub_controls()
+
+    def _update_hub_controls(self) -> None:
+        actual = self.backend.hub_exists()
+        desired = self._hub_desired_present  # None or bool
+
+        if desired is None:
+            if actual:
+                self.hub_status.setText("On")
+                self.hub_status.set_state("on")
+                self.hub_status.setToolTip("Hub sink exists.")
+                self.hub_btn.setText("Destroy aSyphon sink")
+                self.hub_btn.setObjectName("Danger")
+            else:
+                self.hub_status.setText("Off")
+                self.hub_status.set_state("off")
+                self.hub_status.setToolTip("Hub sink does not exist.")
+                self.hub_btn.setText("Create aSyphon sink")
+                self.hub_btn.setObjectName("")
+        else:
+            self.hub_status.setText("Pending")
+            self.hub_status.set_state("pending")
+            self.hub_status.setToolTip("Pending hub change (Apply to commit).")
+            if desired:
+                self.hub_btn.setText("Create aSyphon sink")
+                self.hub_btn.setObjectName("DangerPending" if actual else "Primary")
+            else:
+                self.hub_btn.setText("Destroy aSyphon sink")
+                self.hub_btn.setObjectName("DangerPending")
+
+        self.hub_btn.style().unpolish(self.hub_btn)
+        self.hub_btn.style().polish(self.hub_btn)
+
+    def _apply_hub_action(self) -> None:
+        desired = self._hub_desired_present
+        if desired is None:
+            return
+
+        # Apply ordering:
+        # - If desired is create: do it now.
+        # - If desired is destroy: do it at the end of apply_all (caller handles ordering).
+        if desired:
+            try:
+                self.backend.ensure_hub_sink()
+            except Exception:
+                pass
+
+    def _input_container_layout(self):
+        return self.inputs_list._layout  # type: ignore[attr-defined]
+
+    def _output_container_layout(self):
+        return self.outputs_list._layout  # type: ignore[attr-defined]
+
+    def input_rows(self) -> List[InputRow]:
+        rows: List[InputRow] = []
+        lay = self._input_container_layout()
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, InputRow):
+                rows.append(w)
+        return rows
+
+    def output_rows(self) -> List[OutputRow]:
+        rows: List[OutputRow] = []
+        lay = self._output_container_layout()
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, OutputRow):
+                rows.append(w)
+        return rows
+
+    def add_input_row(self) -> None:
+        row = InputRow()
+        row.remove_requested.connect(self.remove_input_row)
+        lay = self._input_container_layout()
+        lay.insertWidget(lay.count() - 1, row)
+        self._populate_input_combo(row)
+
+    def add_output_row(self) -> None:
+        row = OutputRow()
+        row.remove_requested.connect(self.remove_output_row)
+        lay = self._output_container_layout()
+        lay.insertWidget(lay.count() - 1, row)
+        self._populate_output_combo(row)
+
+    def remove_input_row(self, w: QWidget) -> None:
+        if isinstance(w, InputRow):
+            w.toggle_remove_pending()
+
+    def remove_output_row(self, w: QWidget) -> None:
+        if isinstance(w, OutputRow):
+            w.toggle_remove_pending()
+
+    def _finalize_row_removals(self, widgets: List[QWidget]) -> None:
+        for w in widgets:
+            w.setParent(None)
+            w.deleteLater()
+
+    def refresh_streams_only(self) -> None:
+        if not self.auto_refresh.isChecked():
+            return
+        try:
+            self._rebuild_choices()
+            for row in self.input_rows():
+                self._populate_input_combo(row)
+            # Also update hub existence display even on "streams only"
+            self._update_hub_controls()
+            self._update_hub_info()
+        except Exception:
+            pass
+
+    def refresh_everything(self) -> None:
+        try:
+            self.server.setText(self.backend.server_label())
+            self._rebuild_choices()
+            self._update_hub_controls()
+            self._update_hub_info()
+
+            for row in self.input_rows():
+                self._populate_input_combo(row)
+            for row in self.output_rows():
+                self._populate_output_combo(row)
+        except Exception as e:
+            QMessageBox.critical(self, "Backend error", str(e))
+
+    def _update_hub_info(self) -> None:
+        hub = self.backend.hub_node_optional()
+        if hub is None:
+            self.hub_info.setText("Hub sink does not exist.")
+            return
+        in_ch = self.backend._node_channel_count(hub.id, "in")
+        out_ch = self.backend._node_channel_count(hub.id, "out")
+        self.hub_info.setText(
+            f"Sink: {hub.description}  [{hub.name}]  ({in_ch}ch in)\n"
+            f"Monitor: ({out_ch}ch out)"
+        )
+
+    def _rebuild_choices(self) -> None:
+        streams = self.backend.list_stream_nodes()
+        sources = self.backend.list_source_nodes()
+        sinks = self.backend.list_sink_nodes()
+        hub = self.backend.hub_node_optional()
+        hub_id = hub.id if hub is not None else None
+
+        stream_choices: List[InputChoice] = [
+            InputChoice(kind="stream", key=f"stream:{n.id}", display=self.backend.stream_label(n))
+            for n in sorted(streams, key=lambda x: self.backend.stream_label(x).lower())
+        ]
+
+        source_choices: List[InputChoice] = [
+            InputChoice(kind="source", key=f"source:{n.id}", display=self.backend.node_label_with_ch(n, "out"))
+            for n in sorted(sources, key=lambda x: (x.description.lower(), x.name.lower()))
+        ]
+
+        sink_choices: List[InputChoice] = []
+        for n in sorted(sinks, key=lambda x: (x.description.lower(), x.name.lower())):
+            if hub_id is not None and n.id == hub_id:
+                continue
+            try:
+                tap_ports = self.backend._sink_monitor_output_ports(n.id)
+            except Exception:
+                tap_ports = []
+            if not tap_ports:
+                continue
+            sink_choices.append(
+                InputChoice(kind="sink", key=f"sink:{n.id}", display=f"Tap sink: {self.backend.node_label_with_ch(n, 'in')}")
+            )
+
+        self._input_choices = stream_choices + source_choices + sink_choices
+
+        self._output_choices = [
+            OutputChoice(key=f"sink:{n.id}", display=self.backend.node_label_with_ch(n, "in"))
+            for n in sorted(sinks, key=lambda x: (x.description.lower(), x.name.lower()))
+            if hub_id is None or n.id != hub_id
+        ]
+
+    def _populate_input_combo(self, row: InputRow) -> None:
+        prev = row.selected_choice()
+        prev_key = prev.key if prev else None
+
+        streams = [c for c in self._input_choices if c.kind == "stream"]
+        sources = [c for c in self._input_choices if c.kind == "source"]
+        sinks = [c for c in self._input_choices if c.kind == "sink"]
+
+        row.combo.blockSignals(True)
+        row.combo.clear()
+
+        def add_group(title: str, items: List[InputChoice]) -> None:
+            if not items:
+                return
+            row.combo.addItem(title, None)
+            row.combo.model().item(row.combo.count() - 1).setEnabled(False)  # type: ignore[attr-defined]
+            for it in items:
+                row.combo.addItem(it.display, it)
+            row.combo.insertSeparator(row.combo.count())
+
+        add_group("— App streams —", streams)
+        add_group("— Capture sources —", sources)
+        add_group("— Tap sinks (monitor) —", sinks)
+
+        if prev_key:
+            for i in range(row.combo.count()):
+                d = row.combo.itemData(i)
+                if isinstance(d, InputChoice) and d.key == prev_key:
+                    row.combo.setCurrentIndex(i)
+                    break
+        else:
+            for i in range(row.combo.count()):
+                if isinstance(row.combo.itemData(i), InputChoice):
+                    row.combo.setCurrentIndex(i)
+                    break
+
+        row.combo.blockSignals(False)
+
+    def _populate_output_combo(self, row: OutputRow) -> None:
+        prev_id = row.selected_sink_node_id()
+        prev_key = f"sink:{prev_id}" if prev_id is not None else None
+
+        row.combo.blockSignals(True)
+        row.combo.clear()
+
+        for c in self._output_choices:
+            row.combo.addItem(c.display, c.key)
+
+        if prev_key:
+            idx = row.combo.findData(prev_key)
+            if idx >= 0:
+                row.combo.setCurrentIndex(idx)
+
+        row.combo.blockSignals(False)
+
+    def apply_all(self) -> None:
+        errors: List[str] = []
+        input_remove: List[QWidget] = []
+        output_remove: List[QWidget] = []
+
+        try:
+            # If hub has a pending create, do it first.
+            self._apply_hub_action()
+
+            # Apply row changes first (connections may auto-create hub; destroy is applied last).
+            for r in self.input_rows():
+                try:
+                    if r.apply(self.backend):
+                        input_remove.append(r)
+                except Exception as e:
+                    errors.append(str(e))
+
+            for r in self.output_rows():
+                try:
+                    if r.apply(self.backend):
+                        output_remove.append(r)
+                except Exception as e:
+                    errors.append(str(e))
+
+            # If hub has a pending destroy, do it last so "destroy" wins.
+            if self._hub_desired_present is False:
+                try:
+                    self.backend.destroy_hub_sink()
+                except Exception:
+                    pass
+
+            # Commit hub action state (pending resolved)
+            if self._hub_desired_present is not None:
+                self._hub_desired_present = None
+
+            # Remove rows after apply
+            self._finalize_row_removals(input_remove + output_remove)
+
+            # Refresh UI to reflect reality
+            self.refresh_everything()
+
+        except Exception as e:
+            errors.append(str(e))
+
+        if errors:
+            QMessageBox.critical(self, "Apply issues", "\n".join(errors))
+
+    def closeEvent(self, event) -> None:
+        try:
+            for r in self.input_rows():
+                r.disconnect_now(self.backend)
+            for r in self.output_rows():
+                r.disconnect_now(self.backend)
+        except Exception:
+            pass
+
+        try:
+            self.backend.destroy_hub_sink_if_owned()
+        except Exception:
+            pass
+
+        try:
+            self.backend.close()
+        except Exception:
+            pass
+
+        super().closeEvent(event)
+# models.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass(frozen=True)
+class AudioNode:
+    id: int
+    name: str
+    description: str
+    media_class: str
+    props: Dict[str, str]
+
+
+@dataclass(frozen=True)
+class InputChoice:
+    # kind: "stream" | "source" | "sink"
+    kind: str
+    key: str  # "stream:<node_id>" | "source:<node_id>" | "sink:<node_id>"
+    display: str
+
+
+@dataclass(frozen=True)
+class OutputChoice:
+    key: str   # "sink:<node_id>"
+    display: str
+# rows.py
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QSizePolicy
+
+from models import InputChoice
+from backend import PipeWireHubBackend
+from widgets import ToggleSwitch, ElideComboBox, StatusPill
+
+
+LinkPairs = List[Tuple[str, str]]
+
+
+class InputRow(QWidget):
+    remove_requested = Signal(QWidget)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("RowCard")
+
+        self.combo = ElideComboBox()
+        self.combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.switch = ToggleSwitch()
+        self.status = StatusPill()
+
+        self.remove_btn = QPushButton("✕")
+        self.remove_btn.setObjectName("Remove")
+        self.remove_btn.setFixedSize(32, 28)
+        self.remove_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+
+        # Applied state (post-Apply)
+        self._applied_mode: Optional[str] = None  # None | "stream" | "source" | "sink"
+        self._applied_choice_key: Optional[str] = None
+        self._created: LinkPairs = []
+
+        # UI-intent state (pre-Apply)
+        self._remove_pending: bool = False
+        self._error: Optional[str] = None
+
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(10)
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.status, 0, Qt.AlignVCenter)
+        row.addWidget(self.switch, 0, Qt.AlignVCenter)
+        row.addWidget(self.remove_btn, 0, Qt.AlignVCenter)
+        self.setLayout(row)
+
+        self.switch.toggled.connect(lambda _v: self._on_user_change())
+        self.combo.currentIndexChanged.connect(lambda _i: self._on_user_change())
+
+        self._sync_ui()
+
+    def _on_user_change(self) -> None:
+        # Any manual change clears error and re-evaluates pending state.
+        self._error = None
+        self._sync_ui()
+
+    def toggle_remove_pending(self) -> None:
+        self._remove_pending = not self._remove_pending
+        self._error = None
+        self._sync_ui()
+
+    def _applied_on(self) -> bool:
+        return self._applied_mode is not None and bool(self._created)
+
+    def _desired_on(self) -> bool:
+        # If the row is pending removal, treat it as "will be removed".
+        return bool(self.switch.isChecked()) and not self._remove_pending
+
+    def _selection_key(self) -> Optional[str]:
+        c = self.selected_choice()
+        return c.key if c else None
+
+    def _is_pending(self) -> bool:
+        if self._remove_pending:
+            return True
+
+        desired_on = self._desired_on()
+        applied_on = self._applied_on()
+
+        if desired_on != applied_on:
+            return True
+
+        if desired_on and applied_on:
+            sel = self._selection_key()
+            if sel is None:
+                return True
+            if self._applied_choice_key != sel:
+                return True
+
+        return False
+
+    def _sync_ui(self) -> None:
+        # Remove button style + enablement
+        if self._remove_pending:
+            self.remove_btn.setObjectName("RemovePending")
+            self.remove_btn.setToolTip("Pending removal (Apply to remove).")
+            self.combo.setEnabled(False)
+            self.switch.setEnabled(False)
+        else:
+            self.remove_btn.setObjectName("Remove")
+            self.remove_btn.setToolTip("Remove row (pending until Apply).")
+            self.combo.setEnabled(True)
+            self.switch.setEnabled(True)
+
+        self.remove_btn.style().unpolish(self.remove_btn)
+        self.remove_btn.style().polish(self.remove_btn)
+
+        if self._error is not None:
+            self.status.setText("Error")
+            self.status.set_state("error")
+            self.status.setToolTip(self._error)
+            return
+
+        if self._is_pending():
+            self.status.setText("Pending")
+            self.status.set_state("pending")
+            self.status.setToolTip("Pending changes (Apply to commit).")
+            return
+
+        if self._applied_on():
+            self.status.setText("On")
+            self.status.set_state("on")
+            self.status.setToolTip(self.status.toolTip() or "Connected.")
+        else:
+            self.status.setText("Off")
+            self.status.set_state("off")
+            self.status.setToolTip("")
+
+    def selected_choice(self) -> Optional[InputChoice]:
+        d = self.combo.currentData()
+        return d if isinstance(d, InputChoice) else None
+
+    def disconnect_now(self, backend: PipeWireHubBackend) -> None:
+        try:
+            backend.disconnect_pairs(self._created)
+        except Exception:
+            pass
+
+        self._created = []
+        self._applied_mode = None
+        self._applied_choice_key = None
+        self._error = None
+        self._remove_pending = False
+        self._sync_ui()
+
+    def apply(self, backend: PipeWireHubBackend) -> bool:
+        """
+        Returns True if the row should be removed from the UI after Apply.
+        """
+        self._error = None
+
+        # Pending removal has priority.
+        if self._remove_pending:
+            try:
+                backend.disconnect_pairs(self._created)
+            except Exception:
+                pass
+            self._created = []
+            self._applied_mode = None
+            self._applied_choice_key = None
+            self._sync_ui()
+            return True
+
+        desired_on = self._desired_on()
+        applied_on = self._applied_on()
+        choice = self.selected_choice()
+
+        if not desired_on:
+            if applied_on:
+                try:
+                    backend.disconnect_pairs(self._created)
+                except Exception:
+                    pass
+                self._created = []
+                self._applied_mode = None
+                self._applied_choice_key = None
+            self._sync_ui()
+            return False
+
+        if choice is None:
+            # Keep existing applied state; just surface error.
+            self._error = "No selection."
+            self._sync_ui()
+            return False
+
+        # If selection changed or we were off, we (re)apply.
+        sel_key = choice.key
+        needs_rewire = (not applied_on) or (self._applied_choice_key != sel_key)
+
+        if not needs_rewire:
+            # Nothing to do.
+            self._sync_ui()
+            return False
+
+        # Drop prior links created by this row (only those).
+        if self._created:
+            try:
+                backend.disconnect_pairs(self._created)
+            except Exception:
+                pass
+            self._created = []
+            self._applied_mode = None
+            self._applied_choice_key = None
+
+        try:
+            kind = choice.kind
+            node_id = int(sel_key.split(":", 1)[1])
+
+            if kind == "stream":
+                created = backend.connect_stream_to_hub(node_id)
+                tooltip = "PipeWire links: stream outputs → aSyphon inputs."
+
+            elif kind == "source":
+                created = backend.connect_source_to_hub(node_id)
+                tooltip = "PipeWire links: source outputs → aSyphon inputs."
+
+            elif kind == "sink":
+                created = backend.connect_sink_tap_to_hub(node_id)
+                tooltip = "PipeWire links: sink monitor outputs → aSyphon inputs."
+
+            else:
+                raise RuntimeError("Unknown input kind.")
+
+            self._created = created
+            self._applied_mode = kind
+            self._applied_choice_key = sel_key
+            self.status.setToolTip(tooltip)
+        except Exception as e:
+            self._created = []
+            self._applied_mode = None
+            self._applied_choice_key = None
+            self._error = str(e)
+
+        self._sync_ui()
+        return False
+
+
+class OutputRow(QWidget):
+    remove_requested = Signal(QWidget)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("RowCard")
+
+        self.combo = ElideComboBox()
+        self.combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.switch = ToggleSwitch()
+        self.status = StatusPill()
+
+        self.remove_btn = QPushButton("✕")
+        self.remove_btn.setObjectName("Remove")
+        self.remove_btn.setFixedSize(32, 28)
+        self.remove_btn.setCursor(Qt.PointingHandCursor)
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+
+        # Applied state
+        self._applied_sink_id: Optional[int] = None
+        self._created: LinkPairs = []
+
+        # UI-intent
+        self._remove_pending: bool = False
+        self._error: Optional[str] = None
+
+        row = QHBoxLayout()
+        row.setContentsMargins(10, 8, 10, 8)
+        row.setSpacing(10)
+        row.addWidget(self.combo, 1)
+        row.addWidget(self.status, 0, Qt.AlignVCenter)
+        row.addWidget(self.switch, 0, Qt.AlignVCenter)
+        row.addWidget(self.remove_btn, 0, Qt.AlignVCenter)
+        self.setLayout(row)
+
+        self.switch.toggled.connect(lambda _v: self._on_user_change())
+        self.combo.currentIndexChanged.connect(lambda _i: self._on_user_change())
+
+        self._sync_ui()
+
+    def _on_user_change(self) -> None:
+        self._error = None
+        self._sync_ui()
+
+    def toggle_remove_pending(self) -> None:
+        self._remove_pending = not self._remove_pending
+        self._error = None
+        self._sync_ui()
+
+    def _applied_on(self) -> bool:
+        return self._applied_sink_id is not None and bool(self._created)
+
+    def _desired_on(self) -> bool:
+        return bool(self.switch.isChecked()) and not self._remove_pending
+
+    def _selected_sink_id(self) -> Optional[int]:
+        d = self.combo.currentData()
+        if not isinstance(d, str):
+            return None
+        if not d.startswith("sink:"):
+            return None
+        try:
+            return int(d.split(":", 1)[1])
+        except Exception:
+            return None
+
+    def _is_pending(self) -> bool:
+        if self._remove_pending:
+            return True
+
+        desired_on = self._desired_on()
+        applied_on = self._applied_on()
+
+        if desired_on != applied_on:
+            return True
+
+        if desired_on and applied_on:
+            sel = self._selected_sink_id()
+            if sel is None:
+                return True
+            if sel != self._applied_sink_id:
+                return True
+
+        return False
+
+    def _sync_ui(self) -> None:
+        if self._remove_pending:
+            self.remove_btn.setObjectName("RemovePending")
+            self.remove_btn.setToolTip("Pending removal (Apply to remove).")
+            self.combo.setEnabled(False)
+            self.switch.setEnabled(False)
+        else:
+            self.remove_btn.setObjectName("Remove")
+            self.remove_btn.setToolTip("Remove row (pending until Apply).")
+            self.combo.setEnabled(True)
+            self.switch.setEnabled(True)
+
+        self.remove_btn.style().unpolish(self.remove_btn)
+        self.remove_btn.style().polish(self.remove_btn)
+
+        if self._error is not None:
+            self.status.setText("Error")
+            self.status.set_state("error")
+            self.status.setToolTip(self._error)
+            return
+
+        if self._is_pending():
+            self.status.setText("Pending")
+            self.status.set_state("pending")
+            self.status.setToolTip("Pending changes (Apply to commit).")
+            return
+
+        if self._applied_on():
+            self.status.setText("On")
+            self.status.set_state("on")
+            self.status.setToolTip(self.status.toolTip() or "Connected.")
+        else:
+            self.status.setText("Off")
+            self.status.set_state("off")
+            self.status.setToolTip("")
+
+    def selected_sink_node_id(self) -> Optional[int]:
+        return self._selected_sink_id()
+
+    def disconnect_now(self, backend: PipeWireHubBackend) -> None:
+        try:
+            backend.disconnect_pairs(self._created)
+        except Exception:
+            pass
+        self._created = []
+        self._applied_sink_id = None
+        self._error = None
+        self._remove_pending = False
+        self._sync_ui()
+
+    def apply(self, backend: PipeWireHubBackend) -> bool:
+        """
+        Returns True if the row should be removed from the UI after Apply.
+        """
+        self._error = None
+
+        if self._remove_pending:
+            try:
+                backend.disconnect_pairs(self._created)
+            except Exception:
+                pass
+            self._created = []
+            self._applied_sink_id = None
+            self._sync_ui()
+            return True
+
+        desired_on = self._desired_on()
+        applied_on = self._applied_on()
+
+        if not desired_on:
+            if applied_on:
+                try:
+                    backend.disconnect_pairs(self._created)
+                except Exception:
+                    pass
+                self._created = []
+                self._applied_sink_id = None
+            self._sync_ui()
+            return False
+
+        sink_id = self._selected_sink_id()
+        if sink_id is None:
+            self._error = "No selection."
+            self._sync_ui()
+            return False
+
+        needs_rewire = (not applied_on) or (sink_id != self._applied_sink_id)
+        if not needs_rewire:
+            self._sync_ui()
+            return False
+
+        if self._created:
+            try:
+                backend.disconnect_pairs(self._created)
+            except Exception:
+                pass
+            self._created = []
+            self._applied_sink_id = None
+
+        try:
+            created = backend.connect_hub_to_sink(sink_id)
+            self._created = created
+            self._applied_sink_id = sink_id
+            self.status.setToolTip("PipeWire links: aSyphon monitor outputs → sink inputs.")
+        except Exception as e:
+            self._created = []
+            self._applied_sink_id = None
+            self._error = str(e)
+
+        self._sync_ui()
+        return False
+# theme.py
+from __future__ import annotations
+
+from PySide6.QtGui import QPalette, QColor
+from PySide6.QtWidgets import QApplication
+
+
+def apply_dark_theme(app: QApplication) -> None:
+    app.setStyle("Fusion")
+
+    pal = QPalette()
+    pal.setColor(QPalette.Window, QColor(20, 20, 22))
+    pal.setColor(QPalette.WindowText, QColor(230, 230, 230))
+    pal.setColor(QPalette.Base, QColor(14, 14, 16))
+    pal.setColor(QPalette.AlternateBase, QColor(26, 26, 28))
+    pal.setColor(QPalette.Text, QColor(230, 230, 230))
+    pal.setColor(QPalette.Button, QColor(34, 34, 38))
+    pal.setColor(QPalette.ButtonText, QColor(230, 230, 230))
+    pal.setColor(QPalette.Highlight, QColor(80, 110, 170))
+    pal.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+    pal.setColor(QPalette.Disabled, QPalette.Text, QColor(140, 140, 140))
+    pal.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(140, 140, 140))
+    pal.setColor(QPalette.Disabled, QPalette.WindowText, QColor(140, 140, 140))
+    app.setPalette(pal)
+
+    app.setStyleSheet(
+        """
+        QMainWindow { background: #141416; }
+
+        QLabel#Title {
+            font-size: 16px;
+            font-weight: 650;
+        }
+
+        QFrame#Panel {
+            background: #1b1b1f;
+            border: 1px solid #2a2a30;
+            border-radius: 10px;
+        }
+
+        QWidget#RowCard {
+            background: #1f1f24;
+            border: 1px solid #2a2a30;
+            border-radius: 10px;
+        }
+
+        QComboBox {
+            padding: 6px 10px;
+            border-radius: 8px;
+            border: 1px solid #2a2a30;
+            background: #121216;
+        }
+
+        QComboBox QAbstractItemView {
+            background: #121216;
+            border: 1px solid #2a2a30;
+            selection-background-color: #506eaa;
+        }
+
+        QPushButton {
+            padding: 6px 10px;
+            border-radius: 10px;
+            border: 1px solid #2a2a30;
+            background: #232329;
+        }
+        QPushButton:hover { background: #2a2a33; }
+
+        QPushButton#Primary {
+            background: #2c3a5a;
+            border: 1px solid #3b4f7a;
+        }
+        QPushButton#Primary:hover { background: #34456c; }
+
+        /* Row remove button states */
+        QPushButton#Remove {
+            padding: 0px;
+            border-radius: 10px;
+            border: 1px solid #2a2a30;
+            background: #232329;
+        }
+        QPushButton#Remove:hover { background: #2a2a33; }
+
+        QPushButton#RemovePending {
+            padding: 0px;
+            border-radius: 10px;
+            border: 1px solid #7a6231;
+            background: #3a3424;
+            color: #f3e6c8;
+        }
+        QPushButton#RemovePending:hover { background: #453f2c; }
+
+        /* Hub destroy button */
+        QPushButton#Danger {
+            background: #3a2424;
+            border: 1px solid #7a3131;
+        }
+        QPushButton#Danger:hover { background: #442b2b; }
+
+        /* Pending action emphasis */
+        QPushButton#DangerPending {
+            background: #3a3424;
+            border: 1px solid #7a6231;
+            color: #f3e6c8;
+        }
+        QPushButton#DangerPending:hover { background: #453f2c; }
+        """
+    )
+# widgets.py
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, QRectF, QEasingCurve, QPropertyAnimation, Property, QSize
+from PySide6.QtGui import QPainter, QColor, QFontMetrics, QPen
+from PySide6.QtWidgets import QAbstractButton, QComboBox, QStyle, QStyleOptionComboBox, QLabel
+
+
+class ToggleSwitch(QAbstractButton):
+    """
+    Pastel sliding switch.
+    - checked: On (pastel green)
+    - unchecked: Off (pastel red)
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._offset = 0.0  # 0..1
+        self._anim = QPropertyAnimation(self, b"offset", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.InOutCubic)
+
+        self._on_bg = QColor("#7fd6a6")   # pastel green
+        self._off_bg = QColor("#e58b8b")  # pastel red
+        self._knob = QColor("#f2f2f2")
+        self._border = QColor("#2a2a30")
+
+        self.toggled.connect(self._on_toggled)
+        self._sync_offset()
+
+        self.setFixedSize(46, 24)
+
+    def sizeHint(self) -> QSize:
+        return QSize(46, 24)
+
+    def _sync_offset(self) -> None:
+        self._offset = 1.0 if self.isChecked() else 0.0
+        self.update()
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._anim.stop()
+        self._anim.setStartValue(self._offset)
+        self._anim.setEndValue(1.0 if checked else 0.0)
+        self._anim.start()
+
+    def get_offset(self) -> float:
+        return self._offset
+
+    def set_offset(self, v: float) -> None:
+        self._offset = float(v)
+        self.update()
+
+    offset = Property(float, get_offset, set_offset)
+
+    def paintEvent(self, _event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        r = QRectF(0.5, 0.5, self.width() - 1.0, self.height() - 1.0)
+        radius = r.height() / 2.0
+
+        bg = self._on_bg if self.isChecked() else self._off_bg
+        p.setPen(QPen(self._border, 1.0))
+        p.setBrush(bg)
+        p.drawRoundedRect(r, radius, radius)
+
+        margin = 3.0
+        d = r.height() - 2 * margin
+        x = r.x() + margin + self._offset * (r.width() - 2 * margin - d)
+        knob_rect = QRectF(x, r.y() + margin, d, d)
+
+        p.setPen(Qt.NoPen)
+        p.setBrush(self._knob)
+        p.drawEllipse(knob_rect)
+
+        p.end()
+
+
+class ElideComboBox(QComboBox):
+    """
+    Prevents horizontal overflow by eliding the displayed current text.
+    The popup list remains full text.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(12)
+
+    def paintEvent(self, event) -> None:
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+
+        fm = QFontMetrics(opt.fontMetrics)
+        elide_width = max(10, self.rect().width() - 38)
+        opt.currentText = fm.elidedText(opt.currentText, Qt.ElideRight, elide_width)
+
+        p = QPainter(self)
+        self.style().drawComplexControl(QStyle.CC_ComboBox, opt, p, self)
+        self.style().drawControl(QStyle.CE_ComboBoxLabel, opt, p, self)
+        p.end()
+
+
+class StatusPill(QLabel):
+    """
+    Compact fixed-width status indicator to avoid wide rows.
+    Details go in tooltip.
+    """
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedWidth(90)
+        self.setText("Off")
+        self.set_state("off")
+
+    def set_state(self, state: str) -> None:
+        # state: off | on | pending | error
+        if state == "on":
+            bg = "#233a2c"
+            bd = "#2f6b45"
+            fg = "#cfeedd"
+        elif state == "pending":
+            bg = "#3a3424"
+            bd = "#7a6231"
+            fg = "#f3e6c8"
+        elif state == "error":
+            bg = "#3a2424"
+            bd = "#7a3131"
+            fg = "#f3c8c8"
+        else:
+            bg = "#2a2a30"
+            bd = "#3a3a42"
+            fg = "#d6d6d6"
+
+        self.setStyleSheet(
+            f"""
+            QLabel {{
+                background: {bg};
+                border: 1px solid {bd};
+                border-radius: 10px;
+                padding: 4px 8px;
+                color: {fg};
+                font-weight: 600;
+            }}
+            """
+        )
