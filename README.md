@@ -2,7 +2,7 @@
 
 [Latest release](https://github.com/Retzilience/aSyphon/releases/latest)
 
-![aSyphon flow](https://github.com/Retzilience/aSyphon/raw/main/assets/flow.png)
+![aSyphon flow](https://github.com/Retzilience/aSyphon/raw/main/assets/flow.jpg)
 
 aSyphon is… a siphon. More specifically: a virtual audio siphon for PipeWire / pipewire-pulse on Linux. It creates (or expects) a dedicated “hub” sink named `asyphon`, lets you feed that hub from app streams, capture sources, or sink monitor taps, and optionally routes the hub’s monitor output to one or more output sinks.
 
