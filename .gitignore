@@ -20,3 +20,5 @@ __pycache__/
 *.zip
 *.png
 aSyphon02
+# allow png assets for the repo UI/readme/etc
+!assets/**/*.png
