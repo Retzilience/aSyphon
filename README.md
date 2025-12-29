@@ -11,7 +11,7 @@ It is not a mixer UI in the PulseAudio sense and it is not trying to replace qpw
 aSyphon provides a simple model:
 
 - **Inputs → hub sink**: You select one or more inputs and connect them into the `asyphon` sink.
-- **Hub monitor → outputs**: You select one or more output sinks and connect the hub’s monitor ports to them.
+- **Hub monitor → outputs**: You select one or more output sinks and connect the hub’s monitor ports to them. This is optional, everything you input to aSyphon will be streaming audio to it even if it is not connected to an output. (You can capture audio directly from the aSyphon sink on OBS without having to connect an output, for example).
 - **Apply = commit**: aSyphon does not “live edit” links. It stages intent and applies it by creating/removing PipeWire links via `pw-link`.
 
 The practical result is a persistent “bus” you can treat as an internal audio junction: throw things into it, then decide where they go.
