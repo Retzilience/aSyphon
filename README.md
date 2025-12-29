@@ -8,6 +8,8 @@ It is not a mixer UI in the PulseAudio sense and it is not trying to replace qpw
 
 ## What it does
 
+![aSyphon UI](https://github.com/Retzilience/aSyphon/raw/main/assets/ui.png)
+
 aSyphon provides a simple model:
 
 - **Inputs → hub sink**: You select one or more inputs and connect them into the `asyphon` sink.
