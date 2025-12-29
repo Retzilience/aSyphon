@@ -1,11 +1,22 @@
 # Ignore everything by default
 *
 
-# Keep directories (so negation rules can match files inside)
+# Allow Git to see directories so later negations work
 !*/
 
-# Keep Python sources
+# Allow source + common repo files
 !*.py
-
-# Keep .gitignore itself
+!*.md
+!README*
+!LICENSE*
 !.gitignore
+
+# Allow the update descriptor
+!version.upd
+
+# Explicit ignores (mostly redundant with '*', kept for clarity)
+dist/
+__pycache__/
+*.zip
+*.png
+aSyphon02

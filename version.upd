@@ -1,0 +1,14 @@
+# aSyphon update descriptor (reupdater)
+#
+# One non-comment line per OS is required.
+# Format:
+#   version | os_tag | [flags] | download
+#
+# os_tag: linux | windows | macos
+# flags (optional): deprecated
+# download:
+#   - absolute URL, OR
+#   - "tag/asset" (GitHub Releases), OR
+#   - "asset" (tag defaults to the version string)
+
+# 0.1 | linux   | v0.1/asyphon-linux-x86_64.tar.zst
