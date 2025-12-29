@@ -10,7 +10,7 @@ APP_NAME = "aSyphon"
 REPO_URL = "https://github.com/Retzilience/aSyphon"
 
 # Keep this updated (or override via env/build tooling).
-VERSION = "0.3"
+VERSION = "0.4"
 
 _HASH_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 _TAG_LONG_RE = re.compile(r"^(\d+(?:\.\d+)*)(?:-(\d+)-g([0-9a-f]{7,40}))?$", re.IGNORECASE)

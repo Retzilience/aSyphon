@@ -1,32 +1,38 @@
 # main_window.py
 from __future__ import annotations
 
-from typing import List
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
+    QCheckBox,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
+    QMainWindow,
     QMessageBox,
+    QPushButton,
     QScrollArea,
-    QFrame,
     QSizePolicy,
-    QCheckBox,
+    QVBoxLayout,
+    QWidget,
 )
 
+from app_meta import APP_NAME, REPO_URL, detect_version
 from backend import PipeWireHubBackend
 from models import InputChoice, OutputChoice
-from rows import InputRow, OutputRow
-from widgets import StatusPill
-
-from app_meta import APP_NAME, REPO_URL, detect_version
+from patchbay_settings_dialog import PatchbaySettingsDialog, RESINK_REPO_URL
 from rehelp import HelpDialog, wrap_help_html
-from reupdater import UpdateClient, project_from_repo
+from reupdater import UpdateClient, open_url_external, project_from_repo
+from rows import InputRow, OutputRow
+from store_config import ConfigStore, find_resink_executable_path
+from widgets import StatusPill
 
 
 def _help_html(app_name: str) -> str:
@@ -60,31 +66,10 @@ def _help_html(app_name: str) -> str:
           <li><b>Tap sinks (monitor)</b>: routes audio that is already going to a sink by tapping its monitor output.</li>
         </ul>
 
-        <h2>Routing behavior</h2>
-        <ul>
-          <li><b>Multiple inputs are mixed</b>: if you enable several inputs, they are summed into the hub sink.</li>
-          <li><b>Multiple outputs duplicate</b>: if you enable several outputs, the hub monitor is sent to each selected sink.</li>
-          <li><b>Channel mapping</b>: links are created 1:1 by channel when possible (FL/FR/…/AUX*), otherwise by port order.</li>
-        </ul>
-
-        <h2>Hub controls</h2>
-        <ul>
-          <li><b>Create/Destroy aSyphon sink</b> controls whether the hub sink exists. These are pending until <b>Apply</b>.</li>
-          <li>If the hub sink is missing, aSyphon will attempt to create it via <code>pipewire-pulse</code> when needed.</li>
-          <li>If you destroy the hub, existing links involving it will stop working until it is recreated and <b>Apply</b> is used again.</li>
-        </ul>
-
-        <h2>Auto refresh</h2>
-        <ul>
-          <li><b>Auto refresh</b> periodically re-reads the live PipeWire graph so new streams/devices appear.</li>
-          <li>Disable it if you are making heavy changes externally (qpwgraph, Helvum, scripts) and want a stable UI while you work.</li>
-        </ul>
-
         <h2>Troubleshooting</h2>
         <ul>
           <li><b>No audio?</b> Confirm the input is toggled on, click <b>Apply</b>, then confirm at least one output sink is toggled on and applied.</li>
           <li><b>Input disappeared</b>: some apps recreate streams; click <b>Refresh</b> (or wait for Auto refresh) and re-select if needed.</li>
-          <li><b>Weird channel layout</b>: this can happen with multi-channel devices; mapping prefers explicit channel tags, otherwise falls back to port order.</li>
           <li><b>Hub won’t create</b>: ensure <code>pipewire</code> and <code>pipewire-pulse</code> are running, and that <code>pw-link</code> is available.</li>
         </ul>
 
@@ -103,11 +88,28 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1220, 640)
 
+        self._init_store()
+        self._init_backend()
+        self._init_updater()
+
+        self._build_ui()
+        self._wire_timers()
+
+        self.add_input_row()
+        self.add_output_row()
+        self.refresh_everything()
+
+    def _init_store(self) -> None:
+        self.store = ConfigStore()
+        self.store.record_last_exe_path()
+
+    def _init_backend(self) -> None:
         self.backend = PipeWireHubBackend()
         self._input_choices: List[InputChoice] = []
         self._output_choices: List[OutputChoice] = []
         self._hub_desired_present: bool | None = None
 
+    def _init_updater(self) -> None:
         self._project = project_from_repo(
             REPO_URL,
             version=detect_version(),
@@ -117,6 +119,7 @@ class MainWindow(QMainWindow):
         )
         self._updater = UpdateClient(self, self._project)
 
+    def _build_ui(self) -> None:
         root = QWidget()
         outer = QVBoxLayout()
         outer.setContentsMargins(12, 12, 12, 12)
@@ -124,6 +127,10 @@ class MainWindow(QMainWindow):
         root.setLayout(outer)
         self.setCentralWidget(root)
 
+        outer.addLayout(self._build_header())
+        outer.addLayout(self._build_body(), 1)
+
+    def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
         header.setSpacing(10)
 
@@ -155,8 +162,10 @@ class MainWindow(QMainWindow):
         header.addWidget(self.auto_refresh)
         header.addWidget(refresh_btn)
         header.addWidget(self.apply_btn)
-        outer.addLayout(header)
 
+        return header
+
+    def _build_body(self) -> QHBoxLayout:
         body = QHBoxLayout()
         body.setSpacing(12)
 
@@ -173,12 +182,10 @@ class MainWindow(QMainWindow):
         body.addWidget(self.inputs_panel, 3)
         body.addWidget(self.hub_panel, 2)
         body.addWidget(self.outputs_panel, 3)
-        outer.addLayout(body, 1)
 
-        self.add_input_row()
-        self.add_output_row()
-        self.refresh_everything()
+        return body
 
+    def _wire_timers(self) -> None:
         self.timer = QTimer(self)
         self.timer.setInterval(1200)
         self.timer.timeout.connect(self.refresh_streams_only)
@@ -239,12 +246,13 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(container)
         scroll._container = container  # type: ignore[attr-defined]
-        scroll._layout = v             # type: ignore[attr-defined]
+        scroll._layout = v  # type: ignore[attr-defined]
         return scroll
 
     def _make_hub_panel(self) -> QFrame:
         frame = QFrame()
         frame.setObjectName("Panel")
+
         layout = QVBoxLayout()
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
@@ -283,7 +291,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(hint)
 
         layout.addStretch(1)
+        layout.addLayout(self._build_tools_row())
+
         return frame
+
+    def _build_tools_row(self) -> QHBoxLayout:
+        tools = QHBoxLayout()
+        tools.setSpacing(8)
+
+        self.btn_resink = QPushButton("reSink")
+        self.btn_resink.setToolTip("Launch reSink (separate app, not a patchbay).")
+        self.btn_resink.clicked.connect(self._open_resink_or_prompt)
+
+        self.btn_patchbay = QPushButton("Open Patchbay")
+        self.btn_patchbay.setToolTip("Launch qpwgraph / Helvum / custom patchbay executable.")
+        self.btn_patchbay.clicked.connect(self._open_patchbay)
+
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setFixedWidth(44)
+        self.btn_settings.setToolTip("Patchbay settings")
+        self.btn_settings.clicked.connect(self._open_patchbay_settings)
+
+        tools.addWidget(self.btn_resink)
+        tools.addWidget(self.btn_patchbay)
+        tools.addStretch(1)
+        tools.addWidget(self.btn_settings)
+
+        return tools
 
     def _toggle_hub_desired(self) -> None:
         actual = self.backend.hub_exists()
@@ -336,11 +370,21 @@ class MainWindow(QMainWindow):
 
     def input_rows(self) -> List[InputRow]:
         lay = self._input_container_layout()
-        return [lay.itemAt(i).widget() for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), InputRow)]  # type: ignore[union-attr]
+        out: List[InputRow] = []
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, InputRow):
+                out.append(w)
+        return out
 
     def output_rows(self) -> List[OutputRow]:
         lay = self._output_container_layout()
-        return [lay.itemAt(i).widget() for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), OutputRow)]  # type: ignore[union-attr]
+        out: List[OutputRow] = []
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if isinstance(w, OutputRow):
+                out.append(w)
+        return out
 
     def add_input_row(self) -> None:
         row = InputRow()
@@ -375,12 +419,17 @@ class MainWindow(QMainWindow):
         try:
             self.backend.refresh()
             self._rebuild_choices()
+
             for r in self.input_rows():
                 self._populate_input_combo(r)
+            for r in self.output_rows():
+                self._populate_output_combo(r)
+
             for r in self.input_rows():
                 r.reconcile(self.backend)
             for r in self.output_rows():
                 r.reconcile(self.backend)
+
             self._update_hub_controls()
             self._update_hub_info()
         except Exception:
@@ -504,6 +553,7 @@ class MainWindow(QMainWindow):
 
         row.combo.blockSignals(True)
         row.combo.clear()
+
         for c in self._output_choices:
             row.combo.addItem(c.display, c.key)
 
@@ -511,6 +561,7 @@ class MainWindow(QMainWindow):
             idx = row.combo.findData(prev_key)
             if idx >= 0:
                 row.combo.setCurrentIndex(idx)
+
         row.combo.blockSignals(False)
 
     def apply_all(self) -> None:
@@ -519,6 +570,7 @@ class MainWindow(QMainWindow):
 
         try:
             self.backend.refresh()
+
             for r in self.input_rows():
                 r.reconcile(self.backend)
             for r in self.output_rows():
@@ -551,6 +603,7 @@ class MainWindow(QMainWindow):
                 self._hub_desired_present = None
 
             self.backend.refresh()
+
             for r in self.input_rows():
                 r.reconcile(self.backend)
             for r in self.output_rows():
@@ -564,6 +617,100 @@ class MainWindow(QMainWindow):
 
         if errors:
             QMessageBox.critical(self, "Apply issues", "\n".join(errors))
+
+    def _open_patchbay_settings(self) -> bool:
+        try:
+            dlg = PatchbaySettingsDialog(self.store, self)
+            return dlg.exec() == QDialog.DialogCode.Accepted
+        except Exception as e:
+            QMessageBox.warning(self, "Patchbay settings error", str(e))
+            return False
+
+    def _patchbay_config(self) -> Tuple[str, str]:
+        cfg = self.store.load()
+        sel = (cfg.get("Patchbay", "selected_app", fallback="") or "").strip().lower()
+        custom = (cfg.get("Patchbay", "custom_path", fallback="") or "").strip()
+        return sel, custom
+
+    def _patchbay_is_configured(self, sel: str, custom: str) -> bool:
+        if sel in ("qpwgraph", "helvum"):
+            return True
+        if sel == "custom":
+            return bool(custom)
+        return False
+
+    def _ensure_patchbay_configured(self) -> bool:
+        sel, custom = self._patchbay_config()
+        if self._patchbay_is_configured(sel, custom):
+            return True
+
+        accepted = self._open_patchbay_settings()
+        if not accepted:
+            return False
+
+        sel, custom = self._patchbay_config()
+        return self._patchbay_is_configured(sel, custom)
+
+    def _launch_process(self, cmd: List[str], *, title: str) -> None:
+        try:
+            subprocess.Popen(cmd, close_fds=True)
+        except Exception as e:
+            QMessageBox.warning(self, title, str(e))
+
+    def _open_patchbay(self) -> None:
+        if not self._ensure_patchbay_configured():
+            return
+
+        sel, custom = self._patchbay_config()
+        cmd: Optional[List[str]] = None
+
+        if sel == "qpwgraph":
+            if shutil.which("qpwgraph") is None:
+                QMessageBox.warning(self, "Patchbay not available", "qpwgraph is not available in PATH.")
+                return
+            cmd = ["qpwgraph"]
+
+        elif sel == "helvum":
+            if shutil.which("helvum") is None:
+                QMessageBox.warning(self, "Patchbay not available", "helvum is not available in PATH.")
+                return
+            cmd = ["helvum"]
+
+        elif sel == "custom":
+            p = custom.strip()
+            if not p:
+                if self._ensure_patchbay_configured():
+                    sel2, custom2 = self._patchbay_config()
+                    if sel2 == "custom" and custom2.strip():
+                        p = custom2.strip()
+                if not p:
+                    return
+            if not os.path.exists(p):
+                QMessageBox.warning(self, "Patchbay not available", "Custom patchbay path does not exist.")
+                return
+            cmd = [p]
+
+        if not cmd:
+            return
+
+        self._launch_process(cmd, title="Failed to launch patchbay")
+
+    def _open_resink_or_prompt(self) -> None:
+        p = (find_resink_executable_path() or "").strip()
+        if p and Path(p).exists():
+            self._launch_process([p], title="Failed to launch reSink")
+            return
+
+        q = QMessageBox.question(
+            self,
+            "reSink not found",
+            "reSink not found in your system, you either don't have it or you need to run the app at least once.\n\n"
+            "Do you want to download the app?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if q == QMessageBox.Yes:
+            open_url_external(RESINK_REPO_URL)
 
     def closeEvent(self, event) -> None:
         try:
