@@ -10,13 +10,27 @@ It is not a mixer UI in the PulseAudio sense and it is not trying to replace qpw
 
 aSyphon provides a simple model:
 
-- **Inputs → hub sink**: You select one or more audio inputs and connect them into the `asyphon` sink.
-- **Hub monitor → outputs**: You select one or more output sinks and connect the hub’s monitor ports to them. This is optional, everything you input to aSyphon will be streaming audio to it even if it is not connected to an output. (You can capture audio directly from the aSyphon sink on OBS without having to connect an output, for example).
+- **Inputs → hub sink**: you select one or more audio inputs and connect them into the `asyphon` sink.
+- **Hub monitor → outputs (one, many, or none)**: you select zero or more output sinks and connect the hub’s monitor ports to them.
+  - If you pick **no outputs**, audio still flows into `asyphon` and you can capture it from another app (for example: OBS) without routing it to any speakers.
 - **Apply = commit**: aSyphon does not “live edit” links. It stages intent and applies it by creating/removing PipeWire links via `pw-link`.
 
 The practical result is a persistent “bus” you can treat as an internal audio junction: throw things into it, then decide where they go.
 
 ![aSyphon UI](https://github.com/Retzilience/aSyphon/raw/main/assets/ui.png)
+
+## Use cases
+
+- **Capture-only (no outputs)**: route specific apps into `asyphon`, then select `asyphon` (or its monitor) as an audio source in OBS. Nothing needs to be routed to speakers.
+- **Duplicate to multiple outputs**: feed the hub from one or more inputs, then send the hub monitor to multiple sinks (speakers + HDMI + another virtual sink, etc.).
+- **Tap existing audio without changing where you hear it**: tap a sink monitor as an input, so you can siphon what is already playing, while it continues going to its original destination.
+
+## Definitions
+
+- **Hub sink (`asyphon`)**: a virtual sink that acts like a bucket. You send audio into it like any other output device.
+- **Input**: a thing that produces audio you want to siphon into the hub (an app stream, a microphone/source, or a monitor tap).
+- **Output**: a sink you want the hub to feed. Outputs are optional: one, many, or none.
+- **Monitor**: “what is playing into a sink.” The hub’s monitor is what you route out to outputs, and what capture apps can also record.
 
 ## Concepts
 
@@ -29,7 +43,7 @@ Even though the sink is created via Pulse, routing is done using **native PipeWi
 Routing is implemented by creating and destroying links (port-to-port connections) in the PipeWire graph using `pw-link`. aSyphon is deliberately explicit about this: if a link exists, audio flows; if it does not, it does not.
 
 ### Monitor output
-Outputs are driven from the hub sink’s monitor ports. The monitor is “what is playing into the sink”, exposed as output ports in the PipeWire graph. Sending the hub monitor to outputs effectively “duplicates” whatever you fed into the hub.
+Outputs are driven from the hub sink’s monitor ports. The monitor is “what is playing into the sink”, exposed as output ports in the PipeWire graph. Sending the hub monitor to outputs effectively duplicates whatever you fed into the hub.
 
 ## Input types
 
@@ -37,7 +51,7 @@ aSyphon supports three classes of input:
 
 - **App streams**: per-application audio outputs (for example: a media player, a browser’s audio stream, a game, etc.).
 - **Capture sources**: PipeWire sources (microphones, capture cards, virtual sources).
-- **Tap sinks (monitor)**: you can tap a sink’s monitor output to siphon audio that is already going to some sink.
+- **Tap sinks (monitor)**: you can tap another sink’s monitor output to siphon audio that is already going to some sink.
 
 ## Routing behavior
 
@@ -51,7 +65,7 @@ aSyphon supports three classes of input:
 Each input row represents one potential connection into the hub. You pick a source (stream/source/sink-tap), toggle it on, then apply.
 
 ### Outputs panel
-Each output row represents one potential destination sink. You pick a sink, toggle it on, then apply.
+Each output row represents one potential destination sink. You pick a sink, toggle it on, then apply. Outputs are optional.
 
 ### Hub panel
 The center panel shows whether `asyphon` exists and allows you to request creation/destruction of the hub sink. This change is also staged and only committed on **Apply**.
@@ -63,7 +77,7 @@ Auto refresh periodically re-reads the live PipeWire graph so newly created app 
 
 ## Limitations
 
-aSyphon is intentionally narrow in scope. Current constraints are practical rather than ideological, and most of them are explicitly on the roadmap.
+aSyphon is intentionally narrow in scope.
 
 - **Best with stereo (2ch)**: it works most predictably with common stereo streams and sinks. Multi-channel devices and unusual channel layouts can work, but are more sensitive to how ports are exposed and labeled.
 - **Best-effort channel mapping**: mapping prefers explicit channel tags (FL/FR/…/AUX*) and falls back to port order when tagging is missing or inconsistent. If either side presents ports in a strange order (or mislabels channels), the resulting links can be surprising.
@@ -74,8 +88,8 @@ aSyphon is intentionally narrow in scope. Current constraints are practical rath
 
 - **No audio**
   - Confirm the intended input row is toggled on and you clicked **Apply**.
-  - Confirm at least one output sink is toggled on and you clicked **Apply**.
-  - Confirm the hub sink exists (`asyphon`) and that your routing is hub → output(s), not only input → hub.
+  - If you expect to hear it: confirm at least one output sink is toggled on and you clicked **Apply**.
+  - If you expect to capture it: confirm your capture app is using `asyphon` (or its monitor). You do not need any outputs for capture-only.
 
 - **An input disappeared**
   - Some applications recreate their streams; the old node vanishes and a new one appears.
@@ -102,7 +116,7 @@ Near-term work (not promises, but the direction):
 The Help / About dialog includes:
 
 - Repository / Releases / Bug report buttons
-- “Copy diagnostics” (version + platform + descriptor URL) suitable for issue reports
+- “Copy diagnostics” suitable for issue reports
 
 If you file a bug, include the diagnostics output and a short description of what you expected vs what happened.
 
