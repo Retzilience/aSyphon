@@ -11,4 +11,4 @@
 #   - "tag/asset" (GitHub Releases), OR
 #   - "asset" (tag defaults to the version string)
 
-# 0.1 | linux   | v0.1/asyphon-linux-x86_64.tar.zst
+0.3 | linux | pre-release | https://github.com/Retzilience/aSyphon/releases/download/0.3/aSyphon-linux-0.3.tar.gz
