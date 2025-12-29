@@ -71,7 +71,6 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton#Primary:hover { background: #34456c; }
 
-        /* Row remove button states */
         QPushButton#Remove {
             padding: 0px;
             border-radius: 10px;
@@ -89,14 +88,12 @@ def apply_dark_theme(app: QApplication) -> None:
         }
         QPushButton#RemovePending:hover { background: #453f2c; }
 
-        /* Hub destroy button */
         QPushButton#Danger {
             background: #3a2424;
             border: 1px solid #7a3131;
         }
         QPushButton#Danger:hover { background: #442b2b; }
 
-        /* Unified pending action button (hub create/destroy pending) */
         QPushButton#PendingAction {
             background: #3a3424;
             border: 1px solid #7a6231;

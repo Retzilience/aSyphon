@@ -12,10 +12,8 @@ from main_window import MainWindow
 def main() -> int:
     app = QApplication(sys.argv)
     apply_dark_theme(app)
-
     w = MainWindow()
     w.show()
-
     return app.exec()
 
 

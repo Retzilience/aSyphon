@@ -24,19 +24,98 @@ from models import InputChoice, OutputChoice
 from rows import InputRow, OutputRow
 from widgets import StatusPill
 
+from app_meta import APP_NAME, REPO_URL, detect_version
+from rehelp import HelpDialog, wrap_help_html
+from reupdater import UpdateClient, project_from_repo
+
+
+def _help_html(app_name: str) -> str:
+    return wrap_help_html(
+        f"{app_name} — Help / About",
+        """
+        <p class="muted">
+          aSyphon is a PipeWire graph router centered around a dedicated “hub” sink
+          (<code>asyphon</code>). You can connect one or more inputs into the hub, then route the
+          hub’s monitor output to one or more output sinks.
+        </p>
+
+        <h2>Concepts</h2>
+        <ul>
+          <li><b>Hub sink (<code>asyphon</code>)</b>: a null sink created via <code>pipewire-pulse</code> for broad application compatibility.</li>
+          <li><b>PipeWire links</b>: aSyphon routes audio by creating native PipeWire links.</li>
+          <li><b>Monitor output</b>: outputs are driven from the hub’s monitor ports (i.e., what is “playing” into the hub).</li>
+        </ul>
+
+        <h2>How it works</h2>
+        <ul>
+          <li><b>Inputs → aSyphon</b>: select an app stream, capture source, or sink tap, toggle it on, then click <b>Apply</b>.</li>
+          <li><b>aSyphon → Outputs</b>: select an output sink, toggle it on, then click <b>Apply</b>.</li>
+          <li><b>Apply</b> commits pending changes by creating/removing PipeWire links via <code>pw-link</code>.</li>
+        </ul>
+
+        <h2>Input types</h2>
+        <ul>
+          <li><b>App streams</b>: per-application audio outputs (e.g., a media player or browser tab audio stream).</li>
+          <li><b>Capture sources</b>: PipeWire sources (microphones, capture devices, virtual sources).</li>
+          <li><b>Tap sinks (monitor)</b>: routes audio that is already going to a sink by tapping its monitor output.</li>
+        </ul>
+
+        <h2>Routing behavior</h2>
+        <ul>
+          <li><b>Multiple inputs are mixed</b>: if you enable several inputs, they are summed into the hub sink.</li>
+          <li><b>Multiple outputs duplicate</b>: if you enable several outputs, the hub monitor is sent to each selected sink.</li>
+          <li><b>Channel mapping</b>: links are created 1:1 by channel when possible (FL/FR/…/AUX*), otherwise by port order.</li>
+        </ul>
+
+        <h2>Hub controls</h2>
+        <ul>
+          <li><b>Create/Destroy aSyphon sink</b> controls whether the hub sink exists. These are pending until <b>Apply</b>.</li>
+          <li>If the hub sink is missing, aSyphon will attempt to create it via <code>pipewire-pulse</code> when needed.</li>
+          <li>If you destroy the hub, existing links involving it will stop working until it is recreated and <b>Apply</b> is used again.</li>
+        </ul>
+
+        <h2>Auto refresh</h2>
+        <ul>
+          <li><b>Auto refresh</b> periodically re-reads the live PipeWire graph so new streams/devices appear.</li>
+          <li>Disable it if you are making heavy changes externally (qpwgraph, Helvum, scripts) and want a stable UI while you work.</li>
+        </ul>
+
+        <h2>Troubleshooting</h2>
+        <ul>
+          <li><b>No audio?</b> Confirm the input is toggled on, click <b>Apply</b>, then confirm at least one output sink is toggled on and applied.</li>
+          <li><b>Input disappeared</b>: some apps recreate streams; click <b>Refresh</b> (or wait for Auto refresh) and re-select if needed.</li>
+          <li><b>Weird channel layout</b>: this can happen with multi-channel devices; mapping prefers explicit channel tags, otherwise falls back to port order.</li>
+          <li><b>Hub won’t create</b>: ensure <code>pipewire</code> and <code>pipewire-pulse</code> are running, and that <code>pw-link</code> is available.</li>
+        </ul>
+
+        <h2>Support</h2>
+        <p class="muted">
+          Use the buttons below to open the repository, releases, or file a bug report.
+          Include “Copy diagnostics” output when reporting issues.
+        </p>
+        """,
+    )
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("aSyphon")
+        self.setWindowTitle(APP_NAME)
         self.resize(1220, 640)
 
         self.backend = PipeWireHubBackend()
         self._input_choices: List[InputChoice] = []
         self._output_choices: List[OutputChoice] = []
-
-        # Hub desired presence (None = no pending change)
         self._hub_desired_present: bool | None = None
+
+        self._project = project_from_repo(
+            REPO_URL,
+            version=detect_version(),
+            name=APP_NAME,
+            settings_org="Retzilience",
+            settings_app=APP_NAME,
+        )
+        self._updater = UpdateClient(self, self._project)
 
         root = QWidget()
         outer = QVBoxLayout()
@@ -48,11 +127,14 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.setSpacing(10)
 
-        title = QLabel("aSyphon")
+        title = QLabel(APP_NAME)
         title.setObjectName("Title")
 
         self.server = QLabel(self.backend.server_label())
         self.server.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        help_btn = QPushButton("Help / About")
+        help_btn.clicked.connect(self._open_help)
 
         self.auto_refresh = QCheckBox("Auto refresh")
         self.auto_refresh.setChecked(True)
@@ -69,10 +151,10 @@ class MainWindow(QMainWindow):
         header.addWidget(QLabel("Backend:"))
         header.addWidget(self.server, 2)
         header.addStretch(1)
+        header.addWidget(help_btn)
         header.addWidget(self.auto_refresh)
         header.addWidget(refresh_btn)
         header.addWidget(self.apply_btn)
-
         outer.addLayout(header)
 
         body = QHBoxLayout()
@@ -91,18 +173,25 @@ class MainWindow(QMainWindow):
         body.addWidget(self.inputs_panel, 3)
         body.addWidget(self.hub_panel, 2)
         body.addWidget(self.outputs_panel, 3)
-
         outer.addLayout(body, 1)
 
         self.add_input_row()
         self.add_output_row()
-
         self.refresh_everything()
 
         self.timer = QTimer(self)
         self.timer.setInterval(1200)
         self.timer.timeout.connect(self.refresh_streams_only)
         self.timer.start()
+
+    def _open_help(self) -> None:
+        dlg = HelpDialog(
+            self,
+            self._project,
+            html=_help_html(self._project.name or self._project.repo),
+            updater=self._updater,
+        )
+        dlg.exec()
 
     def _make_panel(self, title: str, add_label: str, add_cb) -> QFrame:
         frame = QFrame()
@@ -128,7 +217,6 @@ class MainWindow(QMainWindow):
         top.addWidget(t)
         top.addStretch(1)
         top.addWidget(add_btn)
-
         layout.addLayout(top)
 
         if "Inputs" in title:
@@ -178,7 +266,6 @@ class MainWindow(QMainWindow):
 
         ctl.addWidget(self.hub_status, 0, Qt.AlignVCenter)
         ctl.addWidget(self.hub_btn, 1)
-
         layout.addLayout(ctl)
 
         self.hub_info = QLabel("")
@@ -187,7 +274,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.hub_info)
 
         hint = QLabel(
-            "• Routing uses PipeWire links (qpwgraph-style), not Pulse loopback modules.\n"
+            "• Routing uses PipeWire links.\n"
             "• aSyphon sink is created via pipewire-pulse for Pulse app compatibility.\n"
             "• Per-row remove and hub create/destroy are pending until Apply."
         )
@@ -200,16 +287,12 @@ class MainWindow(QMainWindow):
 
     def _toggle_hub_desired(self) -> None:
         actual = self.backend.hub_exists()
-        if self._hub_desired_present is None:
-            self._hub_desired_present = (not actual)
-        else:
-            # Second click cancels pending hub change.
-            self._hub_desired_present = None
+        self._hub_desired_present = (not actual) if self._hub_desired_present is None else None
         self._update_hub_controls()
 
     def _update_hub_controls(self) -> None:
         actual = self.backend.hub_exists()
-        desired = self._hub_desired_present  # None or bool
+        desired = self._hub_desired_present
 
         if desired is None:
             if actual:
@@ -225,7 +308,6 @@ class MainWindow(QMainWindow):
                 self.hub_btn.setText("Create aSyphon sink")
                 self.hub_btn.setObjectName("Primary")
         else:
-            # Pending hub change: unified semantics (yellow status + yellow action button)
             self.hub_status.setText("Pending")
             self.hub_status.set_state("pending")
             if desired:
@@ -239,9 +321,8 @@ class MainWindow(QMainWindow):
         self.hub_btn.style().unpolish(self.hub_btn)
         self.hub_btn.style().polish(self.hub_btn)
 
-    def _apply_hub_action_create_if_needed(self) -> None:
-        desired = self._hub_desired_present
-        if desired is True:
+    def _apply_hub_create_if_needed(self) -> None:
+        if self._hub_desired_present is True:
             try:
                 self.backend.ensure_hub_sink()
             except Exception:
@@ -254,22 +335,12 @@ class MainWindow(QMainWindow):
         return self.outputs_list._layout  # type: ignore[attr-defined]
 
     def input_rows(self) -> List[InputRow]:
-        rows: List[InputRow] = []
         lay = self._input_container_layout()
-        for i in range(lay.count()):
-            w = lay.itemAt(i).widget()
-            if isinstance(w, InputRow):
-                rows.append(w)
-        return rows
+        return [lay.itemAt(i).widget() for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), InputRow)]  # type: ignore[union-attr]
 
     def output_rows(self) -> List[OutputRow]:
-        rows: List[OutputRow] = []
         lay = self._output_container_layout()
-        for i in range(lay.count()):
-            w = lay.itemAt(i).widget()
-            if isinstance(w, OutputRow):
-                rows.append(w)
-        return rows
+        return [lay.itemAt(i).widget() for i in range(lay.count()) if isinstance(lay.itemAt(i).widget(), OutputRow)]  # type: ignore[union-attr]
 
     def add_input_row(self) -> None:
         row = InputRow()
@@ -304,20 +375,12 @@ class MainWindow(QMainWindow):
         try:
             self.backend.refresh()
             self._rebuild_choices()
-
-            for row in self.input_rows():
-                self._populate_input_combo(row)
-            for row in self.output_rows():
-                # Outputs are not "stream-based", but the link graph can change (hub destroy/create),
-                # so we still reconcile them.
-                pass
-
-            # Reconcile actual-vs-remembered state (prevents false "On")
-            for row in self.input_rows():
-                row.reconcile(self.backend)
-            for row in self.output_rows():
-                row.reconcile(self.backend)
-
+            for r in self.input_rows():
+                self._populate_input_combo(r)
+            for r in self.input_rows():
+                r.reconcile(self.backend)
+            for r in self.output_rows():
+                r.reconcile(self.backend)
             self._update_hub_controls()
             self._update_hub_info()
         except Exception:
@@ -327,20 +390,19 @@ class MainWindow(QMainWindow):
         try:
             self.backend.refresh()
             self.server.setText(self.backend.server_label())
-
             self._rebuild_choices()
             self._update_hub_controls()
             self._update_hub_info()
 
-            for row in self.input_rows():
-                self._populate_input_combo(row)
-            for row in self.output_rows():
-                self._populate_output_combo(row)
+            for r in self.input_rows():
+                self._populate_input_combo(r)
+            for r in self.output_rows():
+                self._populate_output_combo(r)
 
-            for row in self.input_rows():
-                row.reconcile(self.backend)
-            for row in self.output_rows():
-                row.reconcile(self.backend)
+            for r in self.input_rows():
+                r.reconcile(self.backend)
+            for r in self.output_rows():
+                r.reconcile(self.backend)
         except Exception as e:
             QMessageBox.critical(self, "Backend error", str(e))
 
@@ -360,15 +422,15 @@ class MainWindow(QMainWindow):
         streams = self.backend.list_stream_nodes()
         sources = self.backend.list_source_nodes()
         sinks = self.backend.list_sink_nodes()
+
         hub = self.backend.hub_node_optional()
         hub_id = hub.id if hub is not None else None
 
-        stream_choices: List[InputChoice] = [
+        stream_choices = [
             InputChoice(kind="stream", key=f"stream:{n.id}", display=self.backend.stream_label(n))
             for n in sorted(streams, key=lambda x: self.backend.stream_label(x).lower())
         ]
-
-        source_choices: List[InputChoice] = [
+        source_choices = [
             InputChoice(kind="source", key=f"source:{n.id}", display=self.backend.node_label_with_ch(n, "out"))
             for n in sorted(sources, key=lambda x: (x.description.lower(), x.name.lower()))
         ]
@@ -378,17 +440,20 @@ class MainWindow(QMainWindow):
             if hub_id is not None and n.id == hub_id:
                 continue
             try:
-                tap_ports = self.backend._sink_monitor_output_ports(n.id)
+                tap = self.backend._sink_monitor_output_ports(n.id)
             except Exception:
-                tap_ports = []
-            if not tap_ports:
+                tap = []
+            if not tap:
                 continue
             sink_choices.append(
-                InputChoice(kind="sink", key=f"sink:{n.id}", display=f"Tap sink: {self.backend.node_label_with_ch(n, 'in')}")
+                InputChoice(
+                    kind="sink",
+                    key=f"sink:{n.id}",
+                    display=f"Tap sink: {self.backend.node_label_with_ch(n, 'in')}",
+                )
             )
 
         self._input_choices = stream_choices + source_choices + sink_choices
-
         self._output_choices = [
             OutputChoice(key=f"sink:{n.id}", display=self.backend.node_label_with_ch(n, "in"))
             for n in sorted(sinks, key=lambda x: (x.description.lower(), x.name.lower()))
@@ -439,7 +504,6 @@ class MainWindow(QMainWindow):
 
         row.combo.blockSignals(True)
         row.combo.clear()
-
         for c in self._output_choices:
             row.combo.addItem(c.display, c.key)
 
@@ -447,65 +511,52 @@ class MainWindow(QMainWindow):
             idx = row.combo.findData(prev_key)
             if idx >= 0:
                 row.combo.setCurrentIndex(idx)
-
         row.combo.blockSignals(False)
 
     def apply_all(self) -> None:
         errors: List[str] = []
-        input_remove: List[QWidget] = []
-        output_remove: List[QWidget] = []
+        to_remove: List[QWidget] = []
 
         try:
-            # Reconcile against reality before deciding what needs rewiring.
             self.backend.refresh()
             for r in self.input_rows():
                 r.reconcile(self.backend)
             for r in self.output_rows():
                 r.reconcile(self.backend)
 
-            # If hub has a pending create, do it first.
-            self._apply_hub_action_create_if_needed()
-
-            # Refresh after potential hub creation, so subsequent applies see coherent state.
+            self._apply_hub_create_if_needed()
             self.backend.refresh()
 
-            # Apply row changes first (destroy is applied last so destroy "wins").
             for r in self.input_rows():
                 try:
                     if r.apply(self.backend):
-                        input_remove.append(r)
+                        to_remove.append(r)
                 except Exception as e:
                     errors.append(str(e))
 
             for r in self.output_rows():
                 try:
                     if r.apply(self.backend):
-                        output_remove.append(r)
+                        to_remove.append(r)
                 except Exception as e:
                     errors.append(str(e))
 
-            # If hub has a pending destroy, do it last.
             if self._hub_desired_present is False:
                 try:
                     self.backend.destroy_hub_sink()
                 except Exception:
                     pass
 
-            # Commit hub action state
             if self._hub_desired_present is not None:
                 self._hub_desired_present = None
 
-            # Final refresh + reconcile so UI shows truth (prevents false "On")
             self.backend.refresh()
             for r in self.input_rows():
                 r.reconcile(self.backend)
             for r in self.output_rows():
                 r.reconcile(self.backend)
 
-            # Remove rows after apply
-            self._finalize_row_removals(input_remove + output_remove)
-
-            # Full UI refresh (choices, hub panel, etc.)
+            self._finalize_row_removals(to_remove)
             self.refresh_everything()
 
         except Exception as e:

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 
 @dataclass(frozen=True)
@@ -16,13 +16,12 @@ class AudioNode:
 
 @dataclass(frozen=True)
 class InputChoice:
-    # kind: "stream" | "source" | "sink"
-    kind: str
-    key: str  # "stream:<node_id>" | "source:<node_id>" | "sink:<node_id>"
+    kind: str   # "stream" | "source" | "sink"
+    key: str    # "stream:<id>" | "source:<id>" | "sink:<id>"
     display: str
 
 
 @dataclass(frozen=True)
 class OutputChoice:
-    key: str   # "sink:<node_id>"
+    key: str    # "sink:<id>"
     display: str
